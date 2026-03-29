@@ -11,7 +11,7 @@ the mathematically optimal asset allocation across any set of stocks.
 ---
 
 ## 🚀 Live Demo
-> Run locally — see setup below.
+> Run locally using the steps below — or deploy free on [Streamlit Cloud] (https://portfolio-optimizer-fp0l.onrender.com/)
 
 ---
 
