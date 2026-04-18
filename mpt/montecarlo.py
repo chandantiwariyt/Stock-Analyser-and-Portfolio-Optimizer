@@ -1,92 +1,114 @@
-# mpt/montecarlo.py
-
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
+
+
+def portfolio_return(weights: np.ndarray, ann_returns: pd.Series) -> float:
+    return float(np.dot(weights, ann_returns.values))
+
+
+def portfolio_volatility(weights: np.ndarray, cov_matrix: pd.DataFrame) -> float:
+    return float(np.sqrt(weights @ cov_matrix.values @ weights))
+
+
+def portfolio_sharpe(
+    weights: np.ndarray,
+    ann_returns: pd.Series,
+    cov_matrix: pd.DataFrame,
+    risk_free_rate: float,
+) -> float:
+    volatility = portfolio_volatility(weights, cov_matrix)
+    if volatility == 0:
+        return 0.0
+    return (portfolio_return(weights, ann_returns) - risk_free_rate) / volatility
 
 
 def run_monte_carlo(
     ann_returns: pd.Series,
     cov_matrix: pd.DataFrame,
     risk_free_rate: float = 0.043,
-    n_simulations: int = 10_000
+    n_simulations: int = 10_000,
 ) -> pd.DataFrame:
-    """
-    Randomly generate 10,000 portfolios and compute their
-    return, volatility, and Sharpe ratio.
-    Returns a DataFrame of all simulated portfolios.
-    """
     tickers = ann_returns.index.tolist()
     n_assets = len(tickers)
-    results  = []
-
-    print(f"⚙️  Running {n_simulations:,} Monte Carlo simulations...")
+    results = []
 
     for _ in range(n_simulations):
-        # Random weights that sum to 1
-        w = np.random.random(n_assets)
-        w /= w.sum()
+        weights = np.random.random(n_assets)
+        weights /= weights.sum()
 
-        # Portfolio return & volatility
-        port_return = np.dot(w, ann_returns.values)
-        port_vol    = np.sqrt(w @ cov_matrix.values @ w)
-        sharpe      = (port_return - risk_free_rate) / port_vol
+        results.append(
+            {
+                "return": portfolio_return(weights, ann_returns),
+                "volatility": portfolio_volatility(weights, cov_matrix),
+                "sharpe": portfolio_sharpe(weights, ann_returns, cov_matrix, risk_free_rate),
+                **dict(zip(tickers, weights)),
+            }
+        )
 
-        results.append({
-            "return":     port_return,
-            "volatility": port_vol,
-            "sharpe":     sharpe,
-            **dict(zip(tickers, w))   # store each weight
-        })
+    return pd.DataFrame(results)
 
-    df = pd.DataFrame(results)
-    print(f"✅ Done — {len(df):,} portfolios simulated\n")
-    return df
+
+def _solve_weights(ann_returns: pd.Series, cov_matrix: pd.DataFrame, objective) -> np.ndarray:
+    n_assets = len(ann_returns)
+    initial = np.ones(n_assets) / n_assets
+    bounds = [(0.0, 1.0)] * n_assets
+    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+
+    result = minimize(
+        objective,
+        x0=initial,
+        bounds=bounds,
+        constraints=constraints,
+        method="SLSQP",
+    )
+    if not result.success:
+        raise ValueError(f"Optimization failed: {result.message}")
+    return result.x
+
+
+def optimize_max_sharpe(
+    ann_returns: pd.Series,
+    cov_matrix: pd.DataFrame,
+    risk_free_rate: float = 0.043,
+) -> pd.Series:
+    weights = _solve_weights(
+        ann_returns,
+        cov_matrix,
+        lambda w: -portfolio_sharpe(w, ann_returns, cov_matrix, risk_free_rate),
+    )
+    return pd.Series(
+        {
+            "return": portfolio_return(weights, ann_returns),
+            "volatility": portfolio_volatility(weights, cov_matrix),
+            "sharpe": portfolio_sharpe(weights, ann_returns, cov_matrix, risk_free_rate),
+            **dict(zip(ann_returns.index.tolist(), weights)),
+        }
+    )
+
+
+def optimize_min_volatility(
+    ann_returns: pd.Series,
+    cov_matrix: pd.DataFrame,
+    risk_free_rate: float = 0.043,
+) -> pd.Series:
+    weights = _solve_weights(
+        ann_returns,
+        cov_matrix,
+        lambda w: portfolio_volatility(w, cov_matrix),
+    )
+    return pd.Series(
+        {
+            "return": portfolio_return(weights, ann_returns),
+            "volatility": portfolio_volatility(weights, cov_matrix),
+            "sharpe": portfolio_sharpe(weights, ann_returns, cov_matrix, risk_free_rate),
+            **dict(zip(ann_returns.index.tolist(), weights)),
+        }
+    )
 
 
 def get_optimal_portfolios(mc_df: pd.DataFrame) -> dict:
-    """
-    Extract Max Sharpe and Min Volatility portfolios.
-    """
-    max_sharpe = mc_df.loc[mc_df["sharpe"].idxmax()]
-    min_vol    = mc_df.loc[mc_df["volatility"].idxmin()]
-
-    print("--- Max Sharpe Portfolio ---")
-    print(f"  Return:     {max_sharpe['return']*100:.2f}%")
-    print(f"  Volatility: {max_sharpe['volatility']*100:.2f}%")
-    print(f"  Sharpe:     {max_sharpe['sharpe']:.4f}")
-
-    print("\n--- Min Volatility Portfolio ---")
-    print(f"  Return:     {min_vol['return']*100:.2f}%")
-    print(f"  Volatility: {min_vol['volatility']*100:.2f}%")
-    print(f"  Sharpe:     {min_vol['sharpe']:.4f}")
-
-    return {"max_sharpe": max_sharpe, "min_vol": min_vol}
-
-
-def get_weights(portfolio: pd.Series, tickers: list[str]) -> pd.Series:
-    """
-    Extract and display clean weights from a portfolio row.
-    """
-    weights = portfolio[tickers]
-    print("\n--- Optimal Weights ---")
-    for ticker, w in weights.items():
-        bar = "█" * int(w * 40)
-        print(f"  {ticker:8s} {w*100:5.1f}%  {bar}")
-    return weights
-
-
-if __name__ == "__main__":
-    import sys, os
-    sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-    from data.fetcher import fetch_prices
-    from mpt.returns  import compute_returns, annualized_returns, covariance_matrix
-
-    tickers  = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
-    prices   = fetch_prices(tickers)
-    returns  = compute_returns(prices)
-    ann_ret  = annualized_returns(returns)
-    cov      = covariance_matrix(returns)
-
-    mc_df    = run_monte_carlo(ann_ret, cov)
-    optimal  = get_optimal_portfolios(mc_df)
-    weights  = get_weights(optimal["max_sharpe"], tickers)
+    return {
+        "max_sharpe": mc_df.loc[mc_df["sharpe"].idxmax()],
+        "min_vol": mc_df.loc[mc_df["volatility"].idxmin()],
+    }
