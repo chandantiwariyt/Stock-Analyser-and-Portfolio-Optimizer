@@ -1,87 +1,135 @@
-# 📈 Stock Portfolio Optimizer — Modern Portfolio Theory
+# Stock Portfolio Optimizer
 
-An interactive portfolio optimization tool built with Python that uses
-**Modern Portfolio Theory (MPT)** and **Monte Carlo simulation** to find
-the mathematically optimal asset allocation across any set of stocks.
+An interactive Streamlit app for portfolio analysis across Indian and U.S. stocks with INR-aware pricing, exact optimization, benchmark comparison, watchlist tracking, and plain-English portfolio commentary.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.x-red)
 ![Plotly](https://img.shields.io/badge/Plotly-5.x-purple)
+![SciPy](https://img.shields.io/badge/SciPy-Optimization-orange)
 
----
+## What This App Does
 
-## 🚀 Live Demo
-> Run locally using the steps below — or deploy free on [Streamlit Cloud](https://portfolio-optimizer-fp0l.onrender.com/)
+- Optimizes stock portfolios using both Monte Carlo simulation and exact `scipy` optimization
+- Supports Indian and U.S. stocks in the same workflow
+- Shows Indian stocks in INR at native market price
+- Converts non-INR stocks like `AAPL` into INR for comparison
+- Tracks selected tickers in a separate watchlist tab
+- Compares portfolio performance against `NIFTY 50` and `S&P 500`
+- Calculates per-stock and portfolio drawdown
+- Suggests rupee allocation amounts based on your portfolio size
+- Generates a downloadable PDF summary
+- Produces simple `Buy`, `Hold`, or `Sell` suggestions from market conditions
+- Adds plain-English AI-style commentary from the computed metrics
 
----
+## Current Features
 
-## 📌 What It Does
+### Optimizer
 
-- **Fetches real market data** — 12 months of historical prices via `yfinance`
-- **Computes MPT statistics** — annualized returns, volatility (σ), covariance matrix
-- **Runs 10,000 Monte Carlo simulations** — randomly weighted portfolios mapping the full risk/return universe
-- **Finds the optimal portfolio** — maximizes the Sharpe ratio (risk-adjusted return)
-- **Visualizes the efficient frontier** — interactive scatter plot color-graded by Sharpe ratio
-- **Asset breakdown table** — per-stock return, volatility, Sharpe, and correlation
+- Custom date range: `1M`, `3M`, `6M`, `1Y`, `3Y`, `5Y`
+- Monte Carlo efficient frontier
+- Exact max-Sharpe portfolio
+- Exact minimum-volatility portfolio
+- Correlation heatmap
+- Asset breakdown with volatility, Sharpe, drawdown, and decision signal
+- Benchmark comparison chart and stats
+- Rupee allocation table
+- PDF export
+- AI-style summary commentary
 
----
+### Watchlist
 
-## 🧠 Key Concepts
+- Add Indian or U.S. stocks
+- Track live price, previous close, daily change, and INR value
+- Keep Indian stocks in rupees without incorrect USD multiplication
+- Convert foreign stocks into INR for display
 
-| Concept | Description |
-|---|---|
-| **Efficient Frontier** | The set of portfolios with the highest return for a given level of risk |
-| **Sharpe Ratio** | `(Return - RiskFreeRate) / Volatility` — measures risk-adjusted performance |
-| **Max Sharpe Portfolio** | The single optimal portfolio on the efficient frontier |
-| **Min Volatility Portfolio** | The lowest-risk portfolio regardless of return |
-| **Covariance Matrix** | Captures how stocks move together — key to diversification |
+## Why INR Handling Matters
 
----
+This project treats Indian and U.S. stocks differently on purpose:
 
-## 🛠️ Tech Stack
+- Indian stocks like `BHEL` stay in INR because their market price is already in rupees
+- U.S. stocks like `AAPL` are converted into INR so you can compare them in one currency view
 
-- `yfinance` — market data fetching
-- `numpy` / `pandas` — numerical computing & data wrangling
-- `plotly` — interactive charts
-- `streamlit` — web app UI
-- `scipy` — scientific computing
+This avoids the common mistake of multiplying an Indian stock price by the USD-INR rate and showing a fake price.
 
----
+## Tech Stack
 
-## ⚙️ Setup
+- `streamlit` for the web app UI
+- `plotly` for interactive charts
+- `pandas` and `numpy` for data processing
+- `yfinance` for price data
+- `scipy` for exact optimization
+
+## Project Structure
+
+```text
+repo/
+├── app.py
+├── requirements.txt
+├── readme.md
+├── data/
+│   └── fetcher.py
+├── mpt/
+│   ├── montecarlo.py
+│   └── returns.py
+└── charts/
+    └── plotter.py
+```
+
+## Run Locally
+
 ```bash
-git clone https://github.com/YOUR_USERNAME/portfolio-optimizer.git
-cd portfolio-optimizer
+git clone https://github.com/chandantiwariyt/Portfolio-Optimizer-watchlist.git
+cd Portfolio-Optimizer-watchlist
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
----
+If `streamlit` is not recognized on your machine:
 
-## 📁 Project Structure
-```
-portfolio-optimizer/
-├── data/
-│   └── fetcher.py        # yfinance price fetching
-├── mpt/
-│   ├── returns.py        # annualized returns, volatility, covariance
-│   └── montecarlo.py     # 10,000 simulation engine
-├── charts/
-│   └── plotter.py        # Plotly efficient frontier & allocation charts
-├── app.py                # Streamlit web app
-└── requirements.txt
+```bash
+python -m streamlit run app.py
 ```
 
----
+Then open the local URL shown in the terminal, usually:
 
-## 📊 Example Output
+`http://localhost:8501`
 
-**Max Sharpe Portfolio** (AAPL, MSFT, GOOGL, AMZN, NVDA):
-- Expected Return: ~34%
-- Volatility: ~28%
-- Sharpe Ratio: ~1.07
+## How To Use
 
----
+1. Enter stock tickers in the sidebar
+2. Choose a date range
+3. Set your risk-free rate
+4. Enter your portfolio size in INR
+5. Click `Run Analysis`
+6. Review:
+   - optimized portfolio metrics
+   - benchmark comparison
+   - drawdown analysis
+   - allocation table
+   - market-condition suggestions
+   - watchlist prices
 
-## 👤 Author
-Built by **Chandan Tiwari** — [LinkedIn](https://www.linkedin.com/in/chandantiwari4/) · [GitHub](https://github.com/chandantiwariyt)
+## Example Tickers
+
+- U.S. stocks: `AAPL`, `MSFT`, `NVDA`, `GOOGL`, `AMZN`
+- Indian stocks: `BHEL`, `RELIANCE`, `TCS`, `INFY`, `SBIN`
+
+You can also use exchange-specific symbols if needed, such as:
+
+- `BHEL.NS`
+- `RELIANCE.NS`
+- `TCS.NS`
+
+## Notes
+
+- Price data depends on Yahoo Finance availability
+- Benchmark calendars differ between India and U.S. markets, so the app aligns them safely before comparison
+- Generated `__pycache__` files are not part of the source code changes
+
+## Author
+
+Built by **Chandan Tiwari**
+
+- GitHub: [chandantiwariyt](https://github.com/chandantiwariyt)
+- LinkedIn: [chandantiwari4](https://www.linkedin.com/in/chandantiwari4/)

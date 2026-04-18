@@ -46,6 +46,39 @@ def format_inr(value: float) -> str:
     return f"₹{value:,.2f}"
 
 
+def get_market_signal(price_series: pd.Series, annual_return: float, drawdown: float) -> str:
+    series = price_series.dropna()
+    if len(series) < 20:
+        return "Hold"
+
+    current_price = float(series.iloc[-1])
+    sma_20 = float(series.tail(min(20, len(series))).mean())
+    sma_50 = float(series.tail(min(50, len(series))).mean())
+
+    if current_price > sma_20 and sma_20 >= sma_50 and annual_return > 0:
+        return "Buy"
+    if current_price < sma_20 and annual_return < 0:
+        return "Sell"
+    if drawdown <= -0.20:
+        return "Sell"
+    return "Hold"
+
+
+def get_portfolio_signal(
+    benchmark_stats: pd.DataFrame,
+    portfolio_drawdown: float,
+    exact_max_sharpe: pd.Series,
+) -> str:
+    portfolio_return = benchmark_stats.loc["Portfolio", "Cumulative Return (%)"]
+    nifty_return = benchmark_stats.loc["NIFTY 50", "Cumulative Return (%)"]
+
+    if exact_max_sharpe["sharpe"] >= 1.0 and portfolio_return >= nifty_return and portfolio_drawdown > -0.15:
+        return "Buy"
+    if portfolio_drawdown <= -0.18 or portfolio_return < nifty_return - 5:
+        return "Sell"
+    return "Hold"
+
+
 def build_simple_pdf(lines: list[str]) -> bytes:
     escaped_lines = []
     for line in lines:
@@ -108,6 +141,7 @@ def generate_commentary(
     portfolio_drawdown: float,
     benchmark_stats: pd.DataFrame,
     weights: pd.Series,
+    portfolio_signal: str,
 ) -> str:
     top_weight = weights.sort_values(ascending=False).index[0]
     return (
@@ -119,6 +153,7 @@ def generate_commentary(
         f"returned {benchmark_stats.loc['Portfolio', 'Cumulative Return (%)']:.2f}% versus "
         f"{benchmark_stats.loc['NIFTY 50', 'Cumulative Return (%)']:.2f}% for NIFTY 50 and "
         f"{benchmark_stats.loc['S&P 500', 'Cumulative Return (%)']:.2f}% for the S&P 500. "
+        f"Based on the current market condition model, the overall portfolio suggestion is {portfolio_signal}. "
         f"If you want a steadier profile, the minimum-volatility portfolio reduces expected return to "
         f"{exact_min_vol['return'] * 100:.2f}% in exchange for lower risk."
     )
@@ -292,14 +327,27 @@ with optimizer_tab:
             portfolio_series = portfolio_price_series(prices[tickers], weights)
             portfolio_drawdown = max_drawdown(portfolio_series)
 
-            benchmark_rebased = benchmark_prices / benchmark_prices.iloc[0]
-            benchmark_df = pd.DataFrame(
-                {
-                    "Portfolio": portfolio_series / portfolio_series.iloc[0],
-                    "NIFTY 50": benchmark_rebased["^NSEI"],
-                    "S&P 500": benchmark_rebased["^GSPC"],
-                }
-            ).dropna()
+            benchmark_rebased = benchmark_prices.apply(
+                lambda series: series / series.dropna().iloc[0]
+                if not series.dropna().empty
+                else series,
+                axis=0,
+            )
+            benchmark_df = pd.concat(
+                [
+                    (portfolio_series / portfolio_series.iloc[0]).rename("Portfolio"),
+                    benchmark_rebased["^NSEI"].rename("NIFTY 50"),
+                    benchmark_rebased["^GSPC"].rename("S&P 500"),
+                ],
+                axis=1,
+            ).sort_index()
+            benchmark_df = benchmark_df.ffill().dropna()
+
+            if benchmark_df.empty:
+                raise ValueError(
+                    "Benchmark comparison data is unavailable for the selected range. "
+                    "Please try a longer date range."
+                )
 
             benchmark_stats = pd.DataFrame(
                 {
@@ -324,12 +372,19 @@ with optimizer_tab:
                 )
             allocation_df = pd.DataFrame(allocation_rows)
 
+            portfolio_signal = get_portfolio_signal(
+                benchmark_stats,
+                portfolio_drawdown,
+                exact_max_sharpe,
+            )
+
             commentary = generate_commentary(
                 exact_max_sharpe,
                 exact_min_vol,
                 portfolio_drawdown,
                 benchmark_stats,
                 weights,
+                portfolio_signal,
             )
             report_lines = build_report_lines(
                 tickers,
@@ -376,8 +431,8 @@ with optimizer_tab:
             with c4:
                 st.markdown(
                     f"""<div class="metric-card">
-                        <div class="metric-label">Portfolio Drawdown</div>
-                        <div class="metric-value">{portfolio_drawdown * 100:.1f}%</div>
+                        <div class="metric-label">Market Signal</div>
+                        <div class="metric-value">{portfolio_signal}</div>
                     </div>""",
                     unsafe_allow_html=True,
                 )
@@ -488,6 +543,7 @@ with optimizer_tab:
                         "Volatility (%)": round(float(ann_vol[ticker]) * 100, 2),
                         "Sharpe": round(float(sharpe), 2),
                         "Max Drawdown (%)": round(float(dd_assets[ticker]) * 100, 2),
+                        "Decision": get_market_signal(prices[ticker], float(ann_ret[ticker]), float(dd_assets[ticker])),
                         "Avg Correlation": round(float(avg_corr), 3),
                     }
                 )
