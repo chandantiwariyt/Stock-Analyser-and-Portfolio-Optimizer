@@ -1,707 +1,694 @@
-import os
-import sys
-from datetime import datetime
+from __future__ import annotations
 
-import pandas as pd
-import plotly.graph_objects as go
+from datetime import datetime
+from typing import Any
+
 import streamlit as st
 
-sys.path.append(os.path.dirname(__file__))
-
-from data.fetcher import fetch_prices, fetch_watchlist_prices
-from mpt.montecarlo import (
-    get_optimal_portfolios,
-    optimize_max_sharpe,
-    optimize_min_volatility,
-    run_monte_carlo,
-)
-from mpt.returns import (
-    annualized_returns,
-    annualized_volatility,
-    asset_drawdowns,
-    compute_returns,
-    correlation_matrix,
-    covariance_matrix,
-    max_drawdown,
-    portfolio_price_series,
+from niveshx_config import (
+    GOAL_TYPES,
+    GOAL_TYPE_DEFAULTS,
+    KYC_PENDING_COPY,
+    MARKET_DROP_COPY,
+    NOTIFICATION_TEMPLATES,
+    PORTFOLIOS,
+    RISK_QUESTIONS,
+    calculate_future_value,
+    calculate_required_sip,
+    classify_risk_profile,
+    format_currency,
+    get_portfolio_for_risk,
+    is_goal_unrealistic,
 )
 
 
-DATE_RANGE_OPTIONS = {
-    "1M": "1mo",
-    "3M": "3mo",
-    "6M": "6mo",
-    "1Y": "1y",
-    "3Y": "3y",
-    "5Y": "5y",
+STEPS = [
+    "welcome",
+    "profile",
+    "risk",
+    "goal",
+    "portfolio",
+    "execution",
+    "dashboard",
+]
+
+STEP_LABELS = {
+    "welcome": "Login",
+    "profile": "Profile",
+    "risk": "Risk Profiling",
+    "goal": "Goal Creation",
+    "portfolio": "Recommendation",
+    "execution": "Execution",
+    "dashboard": "Dashboard",
 }
 
-BENCHMARKS = {
-    "NIFTY 50": "^NSEI",
-    "S&P 500": "^GSPC",
-}
+
+def init_state() -> None:
+    defaults: dict[str, Any] = {
+        "current_step": "welcome",
+        "otp_sent": False,
+        "logged_in": False,
+        "otp_value": "246810",
+        "user_profile": {
+            "name": "",
+            "phone": "",
+            "age": 30,
+            "city": "Bengaluru",
+            "occupation": "Salaried",
+            "annual_income": 900000,
+            "monthly_income": 75000,
+        },
+        "risk_answers": {},
+        "risk_profile": None,
+        "goals": [],
+        "selected_goal_id": None,
+        "latest_goal_id": None,
+        "kyc_status": "Not Started",
+        "sip_setup": {
+            "status": "Not Started",
+            "amount": 0.0,
+            "debit_day": 5,
+            "bank_name": "",
+            "goal_id": None,
+            "auto_debit": False,
+            "last_status": None,
+        },
+        "notifications": [
+            notification_item("welcome", "Your guided investing workspace is ready."),
+            notification_item("kyc_pending", KYC_PENDING_COPY),
+        ],
+        "delete_goal_id": None,
+    }
+
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 
-def format_inr(value: float) -> str:
-    return f"₹{value:,.2f}"
+def notification_item(kind: str, message: str) -> dict[str, str]:
+    return {
+        "kind": kind,
+        "message": message,
+        "timestamp": datetime.now().strftime("%d %b %Y, %I:%M %p"),
+    }
 
 
-def get_market_signal(price_series: pd.Series, annual_return: float, drawdown: float) -> str:
-    series = price_series.dropna()
-    if len(series) < 20:
-        return "Hold"
-
-    current_price = float(series.iloc[-1])
-    sma_20 = float(series.tail(min(20, len(series))).mean())
-    sma_50 = float(series.tail(min(50, len(series))).mean())
-
-    if current_price > sma_20 and sma_20 >= sma_50 and annual_return > 0:
-        return "Buy"
-    if current_price < sma_20 and annual_return < 0:
-        return "Sell"
-    if drawdown <= -0.20:
-        return "Sell"
-    return "Hold"
+def push_notification(kind: str, custom_message: str | None = None) -> None:
+    message = custom_message or NOTIFICATION_TEMPLATES.get(kind, kind.replace("_", " ").title())
+    st.session_state.notifications.insert(0, notification_item(kind, message))
+    st.session_state.notifications = st.session_state.notifications[:12]
 
 
-def get_portfolio_signal(
-    benchmark_stats: pd.DataFrame,
-    portfolio_drawdown: float,
-    exact_max_sharpe: pd.Series,
-) -> str:
-    portfolio_return = benchmark_stats.loc["Portfolio", "Cumulative Return (%)"]
-    nifty_return = benchmark_stats.loc["NIFTY 50", "Cumulative Return (%)"]
-
-    if exact_max_sharpe["sharpe"] >= 1.0 and portfolio_return >= nifty_return and portfolio_drawdown > -0.15:
-        return "Buy"
-    if portfolio_drawdown <= -0.18 or portfolio_return < nifty_return - 5:
-        return "Sell"
-    return "Hold"
+def go_to(step: str) -> None:
+    st.session_state.current_step = step
 
 
-def build_simple_pdf(lines: list[str]) -> bytes:
-    escaped_lines = []
-    for line in lines:
-        safe = (
-            line.replace("\\", "\\\\")
-            .replace("(", "\\(")
-            .replace(")", "\\)")
-            .encode("ascii", "replace")
-            .decode("ascii")
-        )
-        escaped_lines.append(safe)
-
-    content_parts = ["BT", "/F1 11 Tf", "50 780 Td", "14 TL"]
-    for index, line in enumerate(escaped_lines):
-        if index == 0:
-            content_parts.append(f"({line}) Tj")
-        else:
-            content_parts.append("T*")
-            content_parts.append(f"({line}) Tj")
-    content_parts.append("ET")
-    content_stream = "\n".join(content_parts).encode("ascii")
-
-    objects = []
-    objects.append(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n")
-    objects.append(b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n")
-    objects.append(
-        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n"
-    )
-    objects.append(b"4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n")
-    objects.append(
-        f"5 0 obj << /Length {len(content_stream)} >> stream\n".encode("ascii")
-        + content_stream
-        + b"\nendstream endobj\n"
-    )
-
-    pdf = bytearray(b"%PDF-1.4\n")
-    offsets = [0]
-    for obj in objects:
-        offsets.append(len(pdf))
-        pdf.extend(obj)
-
-    xref_offset = len(pdf)
-    pdf.extend(f"xref\n0 {len(offsets)}\n".encode("ascii"))
-    pdf.extend(b"0000000000 65535 f \n")
-    for offset in offsets[1:]:
-        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
-    pdf.extend(
-        (
-            f"trailer << /Size {len(offsets)} /Root 1 0 R >>\n"
-            f"startxref\n{xref_offset}\n%%EOF"
-        ).encode("ascii")
-    )
-    return bytes(pdf)
+def progress_index(step: str) -> int:
+    return STEPS.index(step) + 1
 
 
-def generate_commentary(
-    exact_max_sharpe: pd.Series,
-    exact_min_vol: pd.Series,
-    portfolio_drawdown: float,
-    benchmark_stats: pd.DataFrame,
-    weights: pd.Series,
-    portfolio_signal: str,
-) -> str:
-    top_weight = weights.sort_values(ascending=False).index[0]
-    return (
-        f"The exact optimizer currently places the highest weight on {top_weight}. "
-        f"The max-Sharpe portfolio targets an annualized return of {exact_max_sharpe['return'] * 100:.2f}% "
-        f"with volatility near {exact_max_sharpe['volatility'] * 100:.2f}% and a Sharpe ratio of "
-        f"{exact_max_sharpe['sharpe']:.2f}. The worst peak-to-trough decline for the optimized portfolio "
-        f"over the selected window was {portfolio_drawdown * 100:.2f}%. Over the same period, the portfolio "
-        f"returned {benchmark_stats.loc['Portfolio', 'Cumulative Return (%)']:.2f}% versus "
-        f"{benchmark_stats.loc['NIFTY 50', 'Cumulative Return (%)']:.2f}% for NIFTY 50 and "
-        f"{benchmark_stats.loc['S&P 500', 'Cumulative Return (%)']:.2f}% for the S&P 500. "
-        f"Based on the current market condition model, the overall portfolio suggestion is {portfolio_signal}. "
-        f"If you want a steadier profile, the minimum-volatility portfolio reduces expected return to "
-        f"{exact_min_vol['return'] * 100:.2f}% in exchange for lower risk."
-    )
+def current_goal() -> dict[str, Any] | None:
+    selected_goal_id = st.session_state.selected_goal_id or st.session_state.latest_goal_id
+    for goal in st.session_state.goals:
+        if goal["id"] == selected_goal_id:
+            return goal
+    return st.session_state.goals[-1] if st.session_state.goals else None
 
 
-def build_report_lines(
-    tickers: list[str],
-    period_label: str,
-    exact_max_sharpe: pd.Series,
-    allocation_df: pd.DataFrame,
-    benchmark_stats: pd.DataFrame,
-    commentary: str,
-) -> list[str]:
-    lines = [
-        "Portfolio Optimizer Report",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Date Range: {period_label}",
-        f"Tickers: {', '.join(tickers)}",
-        "",
-        "Exact Max-Sharpe Portfolio",
-        f"Expected Return: {exact_max_sharpe['return'] * 100:.2f}%",
-        f"Volatility: {exact_max_sharpe['volatility'] * 100:.2f}%",
-        f"Sharpe Ratio: {exact_max_sharpe['sharpe']:.2f}",
-        "",
-        "Rupee Allocation",
-    ]
-
-    for row in allocation_df.itertuples(index=False):
-        lines.append(
-            f"{row.Ticker}: weight {row[1]:.2f}%, amount {row[2]:,.2f} INR, units {row[3]:.4f}"
-        )
-
-    lines.extend(["", "Benchmark Comparison"])
-    for row in benchmark_stats.itertuples():
-        lines.append(
-            f"{row.Index}: cumulative return {row[1]:.2f}%, annualized return {row[2]:.2f}%, max drawdown {row[3]:.2f}%"
-        )
-
-    lines.extend(["", "AI Commentary", commentary])
-    return lines
+def active_goal_count() -> int:
+    return len([goal for goal in st.session_state.goals if not goal.get("deleted")])
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_prices(tickers: tuple[str, ...], period: str = "1y", interval: str = "1mo") -> pd.DataFrame:
-    return fetch_prices(list(tickers), period=period, interval=interval)
+def update_goal(goal_id: str, updates: dict[str, Any]) -> None:
+    for index, goal in enumerate(st.session_state.goals):
+        if goal["id"] == goal_id:
+            st.session_state.goals[index] = {**goal, **updates}
+            return
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def load_watchlist(entries: tuple[tuple[str, str], ...]) -> pd.DataFrame:
-    payload = [{"symbol": symbol, "market": market} for symbol, market in entries]
-    return fetch_watchlist_prices(payload)
-
-
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = [
-        {"symbol": "BHEL", "market": "India (NSE)"},
-        {"symbol": "AAPL", "market": "United States"},
-    ]
-
-
-st.set_page_config(
-    page_title="Portfolio Optimizer",
-    page_icon="📈",
-    layout="wide",
-)
-
-st.markdown(
-    """
-<style>
-  body, .stApp { background-color: #060810; color: #E2E6F0; }
-  .metric-card {
-    background: #111521; border: 1px solid #1C2238;
-    border-radius: 10px; padding: 18px; text-align: center;
-  }
-  .metric-label { font-size: 11px; color: #5A6882; letter-spacing: 2px; text-transform: uppercase; }
-  .metric-value { font-size: 28px; font-weight: 700; margin-top: 6px; }
-  .gold  { color: #F0B429; }
-  .green { color: #00D9A3; }
-  .blue  { color: #4B7CF3; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-st.markdown("## 📈 Stock Portfolio Optimizer")
-st.markdown("*Portfolio analytics with INR-first pricing and mixed-market support*")
-st.caption(
-    "Indian stocks stay in rupees at their native market price. "
-    "Non-INR stocks, such as AAPL, are converted to INR only for display."
-)
-st.divider()
-
-with st.sidebar:
-    st.markdown("### ⚙️ Optimizer Settings")
-
-    raw_input = st.text_input(
-        "Tickers (comma-separated)",
-        value="AAPL, MSFT, GOOGL, AMZN, NVDA",
-        help="You can enter Indian stocks as `BHEL` or `BHEL.NS`, and U.S. stocks as `AAPL`.",
-    )
-    tickers = [t.strip().upper() for t in raw_input.split(",") if t.strip()]
-    period_label = st.selectbox("Custom Date Range", options=list(DATE_RANGE_OPTIONS.keys()), index=3)
-    period = DATE_RANGE_OPTIONS[period_label]
-
-    risk_free = st.slider(
-        "Risk-Free Rate (%)",
-        min_value=0.0,
-        max_value=10.0,
-        value=4.3,
-        step=0.1,
-    ) / 100
-
-    n_sims = st.selectbox(
-        "Monte Carlo Simulations",
-        options=[1_000, 5_000, 10_000, 20_000],
-        index=2,
-    )
-
-    investment_amount = st.number_input(
-        "Portfolio Size (INR)",
-        min_value=1000.0,
-        value=100000.0,
-        step=1000.0,
-    )
-
-    run = st.button("🚀 Run Analysis", use_container_width=True)
-
-    st.divider()
-    st.markdown("### 👀 Watchlist Tips")
+def render_shell() -> None:
+    current_step = st.session_state.current_step
+    st.set_page_config(page_title="Nivesh X", page_icon="NX", layout="wide")
     st.markdown(
         """
-        - Use the **Watchlist** tab to track current prices
-        - Pick the market when adding Indian shares like `BHEL`
-        - U.S. prices are shown in INR after conversion
-        - Indian prices stay in INR without any USD conversion
-        """
+        <style>
+          .stApp {
+            background:
+              radial-gradient(circle at top right, rgba(5, 150, 105, 0.20), transparent 28%),
+              radial-gradient(circle at top left, rgba(59, 130, 246, 0.15), transparent 24%),
+              linear-gradient(180deg, #f7fbf9 0%, #eef6f3 100%);
+            color: #0f172a;
+          }
+          .hero-card, .surface-card, .goal-card, .feed-card {
+            background: rgba(255,255,255,0.9);
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            border-radius: 20px;
+            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+            padding: 1.25rem;
+          }
+          .hero-card {
+            padding: 1.5rem;
+            background: linear-gradient(135deg, #0f766e 0%, #1d4ed8 100%);
+            color: white;
+          }
+          .eyebrow {
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 0.14em;
+            opacity: 0.8;
+          }
+          .metric-number {
+            font-size: 2rem;
+            font-weight: 700;
+            line-height: 1.1;
+          }
+          .allocation-chip {
+            display: inline-block;
+            margin: 0.25rem 0.4rem 0 0;
+            padding: 0.35rem 0.7rem;
+            border-radius: 999px;
+            background: #e8f5ef;
+            color: #166534;
+            font-size: 0.85rem;
+            font-weight: 600;
+          }
+          .step-pill {
+            display: inline-block;
+            padding: 0.3rem 0.7rem;
+            border-radius: 999px;
+            background: #dbeafe;
+            color: #1d4ed8;
+            font-size: 0.8rem;
+            font-weight: 700;
+          }
+          .status-good { color: #166534; font-weight: 700; }
+          .status-warn { color: #b45309; font-weight: 700; }
+          .status-bad { color: #b91c1c; font-weight: 700; }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-optimizer_tab, watchlist_tab = st.tabs(["Optimizer", "Watchlist"])
-
-with optimizer_tab:
-    st.markdown("### Portfolio Optimizer")
-    st.caption("Monte Carlo is used for the frontier view, while scipy is used for exact max-Sharpe and minimum-volatility portfolios.")
-
-    if not run:
-        st.info("Add your tickers in the sidebar and click **Run Analysis**.")
-    elif len(tickers) < 2:
-        st.error("Please enter at least 2 tickers.")
-    else:
-        try:
-            with st.spinner("Fetching price data..."):
-                prices = load_prices(tuple(tickers), period=period, interval="1d")
-                benchmark_prices = load_prices(tuple(BENCHMARKS.values()), period=period, interval="1d")
-                current_prices = load_watchlist(tuple((ticker, "") for ticker in tickers)).set_index("Ticker")
-
-            with st.spinner("Computing returns, drawdown, and covariance..."):
-                returns = compute_returns(prices)
-                ann_ret = annualized_returns(returns)
-                ann_vol = annualized_volatility(returns)
-                cov = covariance_matrix(returns)
-                corr = correlation_matrix(returns)
-                dd_assets = asset_drawdowns(prices)
-
-            with st.spinner(f"Running {n_sims:,} Monte Carlo simulations and exact optimization..."):
-                mc_df = run_monte_carlo(ann_ret, cov, risk_free_rate=risk_free, n_simulations=n_sims)
-                random_optimal = get_optimal_portfolios(mc_df)
-                exact_max_sharpe = optimize_max_sharpe(ann_ret, cov, risk_free_rate=risk_free)
-                exact_min_vol = optimize_min_volatility(ann_ret, cov, risk_free_rate=risk_free)
-
-            weights = exact_max_sharpe[tickers]
-            portfolio_series = portfolio_price_series(prices[tickers], weights)
-            portfolio_drawdown = max_drawdown(portfolio_series)
-
-            benchmark_rebased = benchmark_prices.apply(
-                lambda series: series / series.dropna().iloc[0]
-                if not series.dropna().empty
-                else series,
-                axis=0,
-            )
-            benchmark_df = pd.concat(
-                [
-                    (portfolio_series / portfolio_series.iloc[0]).rename("Portfolio"),
-                    benchmark_rebased["^NSEI"].rename("NIFTY 50"),
-                    benchmark_rebased["^GSPC"].rename("S&P 500"),
-                ],
-                axis=1,
-            ).sort_index()
-            benchmark_df = benchmark_df.ffill().dropna()
-
-            if benchmark_df.empty:
-                raise ValueError(
-                    "Benchmark comparison data is unavailable for the selected range. "
-                    "Please try a longer date range."
-                )
-
-            benchmark_stats = pd.DataFrame(
-                {
-                    "Cumulative Return (%)": ((benchmark_df.iloc[-1] / benchmark_df.iloc[0]) - 1.0) * 100,
-                    "Annualized Return (%)": benchmark_df.pct_change().dropna().mean() * 252 * 100,
-                    "Max Drawdown (%)": benchmark_df.apply(max_drawdown) * 100,
-                }
-            )
-
-            allocation_rows = []
-            for ticker in tickers:
-                live_price_inr = float(current_prices.loc[ticker, "Price (INR)"])
-                allocated = investment_amount * float(weights[ticker])
-                units = allocated / live_price_inr if live_price_inr else 0.0
-                allocation_rows.append(
-                    {
-                        "Ticker": ticker,
-                        "Weight (%)": round(float(weights[ticker]) * 100, 2),
-                        "Amount (INR)": round(allocated, 2),
-                        "Estimated Units": round(units, 4),
-                    }
-                )
-            allocation_df = pd.DataFrame(allocation_rows)
-
-            portfolio_signal = get_portfolio_signal(
-                benchmark_stats,
-                portfolio_drawdown,
-                exact_max_sharpe,
-            )
-
-            commentary = generate_commentary(
-                exact_max_sharpe,
-                exact_min_vol,
-                portfolio_drawdown,
-                benchmark_stats,
-                weights,
-                portfolio_signal,
-            )
-            report_lines = build_report_lines(
-                tickers,
-                period_label,
-                exact_max_sharpe,
-                allocation_df,
-                benchmark_stats,
-                commentary,
-            )
-            pdf_bytes = build_simple_pdf(report_lines)
-
-            st.success("Analysis complete.")
-            st.divider()
-
-            c1, c2, c3, c4 = st.columns(4)
-
-            with c1:
-                st.markdown(
-                    f"""<div class="metric-card">
-                        <div class="metric-label">Exact Max Sharpe</div>
-                        <div class="metric-value gold">{exact_max_sharpe['sharpe']:.2f}</div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-
-            with c2:
-                st.markdown(
-                    f"""<div class="metric-card">
-                        <div class="metric-label">Expected Return</div>
-                        <div class="metric-value green">{exact_max_sharpe['return'] * 100:.1f}%</div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-
-            with c3:
-                st.markdown(
-                    f"""<div class="metric-card">
-                        <div class="metric-label">Portfolio Volatility</div>
-                        <div class="metric-value blue">{exact_max_sharpe['volatility'] * 100:.1f}%</div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-
-            with c4:
-                st.markdown(
-                    f"""<div class="metric-card">
-                        <div class="metric-label">Market Signal</div>
-                        <div class="metric-value">{portfolio_signal}</div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-
-            st.divider()
-
-            col1, col2 = st.columns([3, 2])
-
-            with col1:
-                st.markdown("#### Efficient Frontier")
-                fig_ef = go.Figure()
-                fig_ef.add_trace(
-                    go.Scatter(
-                        x=mc_df["volatility"] * 100,
-                        y=mc_df["return"] * 100,
-                        mode="markers",
-                        marker=dict(
-                            size=3,
-                            color=mc_df["sharpe"],
-                            colorscale=[[0, "#4B7CF3"], [0.5, "#00D9A3"], [1, "#F0B429"]],
-                            colorbar=dict(title="Sharpe"),
-                            opacity=0.5,
-                        ),
-                        name="Monte Carlo",
-                    )
-                )
-                fig_ef.add_trace(
-                    go.Scatter(
-                        x=[exact_max_sharpe["volatility"] * 100],
-                        y=[exact_max_sharpe["return"] * 100],
-                        mode="markers+text",
-                        marker=dict(size=15, color="#F0B429", symbol="star"),
-                        text=["Exact Max Sharpe"],
-                        textposition="top center",
-                        textfont=dict(color="#F0B429"),
-                        name="Exact Max Sharpe",
-                    )
-                )
-                fig_ef.add_trace(
-                    go.Scatter(
-                        x=[exact_min_vol["volatility"] * 100],
-                        y=[exact_min_vol["return"] * 100],
-                        mode="markers+text",
-                        marker=dict(size=13, color="#00D9A3", symbol="triangle-up"),
-                        text=["Exact Min Vol"],
-                        textposition="top center",
-                        textfont=dict(color="#00D9A3"),
-                        name="Exact Min Vol",
-                    )
-                )
-                fig_ef.add_trace(
-                    go.Scatter(
-                        x=[random_optimal["max_sharpe"]["volatility"] * 100],
-                        y=[random_optimal["max_sharpe"]["return"] * 100],
-                        mode="markers",
-                        marker=dict(size=10, color="#9B59B6"),
-                        name="Best Monte Carlo",
-                    )
-                )
-                fig_ef.update_layout(
-                    paper_bgcolor="#0C0F1A",
-                    plot_bgcolor="#0C0F1A",
-                    font=dict(color="#A8B3CC"),
-                    xaxis=dict(title="Volatility (%)", gridcolor="#1C2238"),
-                    yaxis=dict(title="Return (%)", gridcolor="#1C2238"),
-                    height=420,
-                    margin=dict(l=40, r=20, t=20, b=40),
-                )
-                st.plotly_chart(fig_ef, use_container_width=True)
-
-            with col2:
-                st.markdown("#### Exact Allocation")
-                fig_pie = go.Figure(
-                    go.Pie(
-                        labels=tickers,
-                        values=[round(float(weights[t]) * 100, 2) for t in tickers],
-                        hole=0.55,
-                        marker=dict(
-                            colors=["#F0B429", "#00D9A3", "#4B7CF3", "#FF4560", "#9B59B6", "#00B4D8"],
-                            line=dict(color="#060810", width=3),
-                        ),
-                        textfont=dict(color="#E2E6F0"),
-                    )
-                )
-                fig_pie.update_layout(
-                    paper_bgcolor="#0C0F1A",
-                    font=dict(color="#A8B3CC"),
-                    height=420,
-                    margin=dict(l=20, r=20, t=20, b=20),
-                )
-                st.plotly_chart(fig_pie, use_container_width=True)
-
-            st.markdown("#### Asset Breakdown")
-            table_data = []
-            for ticker in tickers:
-                avg_corr = (corr[ticker].sum() - 1) / (len(tickers) - 1)
-                ticker_price = current_prices.loc[ticker]
-                sharpe = (ann_ret[ticker] - risk_free) / ann_vol[ticker] if ann_vol[ticker] else 0.0
-                table_data.append(
-                    {
-                        "Ticker": ticker,
-                        "Exchange Symbol": ticker_price["Exchange Symbol"],
-                        "Market": ticker_price["Market"],
-                        "Current Price (INR)": format_inr(float(ticker_price["Price (INR)"])),
-                        "Native Price": f"{ticker_price['Native Price']:.2f} {ticker_price['Native Currency']}",
-                        "Weight (%)": round(float(weights[ticker]) * 100, 2),
-                        "Exp. Return (%)": round(float(ann_ret[ticker]) * 100, 2),
-                        "Volatility (%)": round(float(ann_vol[ticker]) * 100, 2),
-                        "Sharpe": round(float(sharpe), 2),
-                        "Max Drawdown (%)": round(float(dd_assets[ticker]) * 100, 2),
-                        "Decision": get_market_signal(prices[ticker], float(ann_ret[ticker]), float(dd_assets[ticker])),
-                        "Avg Correlation": round(float(avg_corr), 3),
-                    }
-                )
-
-            st.dataframe(pd.DataFrame(table_data).set_index("Ticker"), use_container_width=True)
-
-            comp_col, alloc_col = st.columns(2)
-            with comp_col:
-                st.markdown("#### Benchmark Comparison")
-                fig_bench = go.Figure()
-                for series_name, color in [
-                    ("Portfolio", "#F0B429"),
-                    ("NIFTY 50", "#00D9A3"),
-                    ("S&P 500", "#4B7CF3"),
-                ]:
-                    fig_bench.add_trace(
-                        go.Scatter(
-                            x=benchmark_df.index,
-                            y=(benchmark_df[series_name] - 1.0) * 100,
-                            mode="lines",
-                            line=dict(width=3, color=color),
-                            name=series_name,
-                        )
-                    )
-                fig_bench.update_layout(
-                    paper_bgcolor="#0C0F1A",
-                    plot_bgcolor="#0C0F1A",
-                    font=dict(color="#A8B3CC"),
-                    yaxis=dict(title="Return Since Start (%)", gridcolor="#1C2238"),
-                    xaxis=dict(gridcolor="#1C2238"),
-                    height=360,
-                    margin=dict(l=40, r=20, t=20, b=40),
-                )
-                st.plotly_chart(fig_bench, use_container_width=True)
-                st.dataframe(benchmark_stats.round(2), use_container_width=True)
-
-            with alloc_col:
-                st.markdown("#### Rupee Allocation")
-                st.dataframe(allocation_df, use_container_width=True)
-                st.download_button(
-                    "Download PDF Report",
-                    data=pdf_bytes,
-                    file_name="portfolio_report.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-
-            st.markdown("#### AI Commentary")
-            st.info(commentary)
-
-            st.markdown("#### Correlation Heatmap")
-            fig_corr = go.Figure(
-                go.Heatmap(
-                    z=corr.values,
-                    x=tickers,
-                    y=tickers,
-                    colorscale=[[0, "#4B7CF3"], [0.5, "#111521"], [1, "#F0B429"]],
-                    text=corr.round(2).values,
-                    texttemplate="%{text}",
-                    zmin=-1,
-                    zmax=1,
-                )
-            )
-            fig_corr.update_layout(
-                paper_bgcolor="#0C0F1A",
-                font=dict(color="#A8B3CC"),
-                height=350,
-                margin=dict(l=40, r=20, t=20, b=40),
-            )
-            st.plotly_chart(fig_corr, use_container_width=True)
-        except Exception as exc:
-            st.error(f"Could not complete the optimizer run: {exc}")
-
-with watchlist_tab:
-    st.markdown("### Watchlist")
-    st.caption(
-        "Track Indian and U.S. shares together. Indian symbols stay in INR, while foreign prices are converted to INR for comparison."
+    completed_steps = max(progress_index(current_step) - 1, 0)
+    st.markdown(
+        f"""
+        <div class="hero-card">
+          <div class="eyebrow">Nivesh X V1</div>
+          <h1 style="margin:0.35rem 0 0.45rem 0;">Goal-based investing for everyday Indian families</h1>
+          <p style="margin:0; max-width: 860px;">
+            Build toward a house, retirement, or an emergency fund with simple guidance,
+            clear SIP math, and a calm dashboard that avoids financial jargon.
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    with st.form("add-watchlist-item", clear_on_submit=True):
-        add_col1, add_col2, add_col3 = st.columns([2.2, 2.2, 1.2])
-        with add_col1:
-            new_symbol = st.text_input("Ticker", placeholder="BHEL or AAPL")
-        with add_col2:
-            new_market = st.selectbox("Market", options=["India (NSE)", "India (BSE)", "United States"])
-        with add_col3:
-            add_pressed = st.form_submit_button("Add Ticker", use_container_width=True)
-
-    if add_pressed:
-        cleaned_symbol = new_symbol.strip().upper()
-        if not cleaned_symbol:
-            st.warning("Enter a ticker before adding it to the watchlist.")
-        else:
-            exists = any(
-                item["symbol"] == cleaned_symbol and item["market"] == new_market
-                for item in st.session_state.watchlist
-            )
-            if exists:
-                st.info("That ticker is already in your watchlist.")
-            else:
-                st.session_state.watchlist.append({"symbol": cleaned_symbol, "market": new_market})
-                st.success(f"Added {cleaned_symbol} to the watchlist.")
-
-    if st.session_state.watchlist:
-        remove_options = [
-            f"{item['symbol']} ({item['market']})" for item in st.session_state.watchlist
+    step_names = " -> ".join(
+        [
+            f"[{STEP_LABELS[step]}]" if step == current_step else STEP_LABELS[step]
+            for step in STEPS
         ]
-        remove_choice = st.selectbox("Remove ticker", options=["Keep all"] + remove_options)
-        if st.button("Remove Selected", disabled=remove_choice == "Keep all"):
-            chosen_label = remove_choice
-            st.session_state.watchlist = [
-                item
-                for item in st.session_state.watchlist
-                if f"{item['symbol']} ({item['market']})" != chosen_label
-            ]
-            st.success(f"Removed {chosen_label}.")
+    )
+    st.caption(f"Journey: {step_names}")
+    st.progress(completed_steps / (len(STEPS) - 1) if len(STEPS) > 1 else 0.0)
 
-        entries = tuple((item["symbol"], item["market"]) for item in st.session_state.watchlist)
-        try:
-            with st.spinner("Fetching watchlist prices..."):
-                watchlist_df = load_watchlist(entries)
 
-            metric1, metric2, metric3 = st.columns(3)
-            with metric1:
-                st.metric("Tracked Shares", len(watchlist_df))
-            with metric2:
-                indian_count = int((watchlist_df["Native Currency"] == "INR").sum())
-                st.metric("Indian Shares", indian_count)
-            with metric3:
-                avg_move = watchlist_df["Change (%)"].mean()
-                st.metric("Average Daily Move", f"{avg_move:.2f}%")
+def render_welcome() -> None:
+    st.markdown('<div class="step-pill">Step 1 of 7</div>', unsafe_allow_html=True)
+    st.subheader("Login with mobile OTP")
+    st.write("This prototype simulates OTP verification so we can focus on the product journey.")
 
-            display_df = watchlist_df.copy()
-            display_df["Native Price"] = display_df.apply(
-                lambda row: f"{row['Native Price']:.2f} {row['Native Currency']}", axis=1
+    with st.form("login_form"):
+        phone = st.text_input("Mobile number", value=st.session_state.user_profile["phone"], max_chars=10)
+        submitted = st.form_submit_button("Send OTP", use_container_width=True)
+
+    if submitted:
+        cleaned_phone = "".join(character for character in phone if character.isdigit())
+        if len(cleaned_phone) != 10:
+            st.error("Enter a valid 10-digit mobile number.")
+        else:
+            st.session_state.user_profile["phone"] = cleaned_phone
+            st.session_state.otp_sent = True
+            push_notification("otp_sent", f"OTP sent to +91 {cleaned_phone}. Use 246810 for this prototype.")
+            st.success("OTP sent. Enter 246810 to continue.")
+
+    if st.session_state.otp_sent:
+        with st.form("verify_otp"):
+            otp = st.text_input("Enter OTP", max_chars=6)
+            verified = st.form_submit_button("Verify and continue", use_container_width=True)
+        if verified:
+            if otp == st.session_state.otp_value:
+                st.session_state.logged_in = True
+                push_notification("login_success", "You are signed in and ready to set up your investing plan.")
+                go_to("profile")
+                st.rerun()
+            else:
+                st.error("That OTP is incorrect for the prototype.")
+
+
+def render_profile() -> None:
+    st.markdown('<div class="step-pill">Step 2 of 7</div>', unsafe_allow_html=True)
+    st.subheader("Tell us a little about yourself")
+    profile = st.session_state.user_profile
+
+    with st.form("profile_form"):
+        name = st.text_input("Full name", value=profile["name"], placeholder="Aarav Sharma")
+        age = st.slider("Age", min_value=23, max_value=45, value=int(profile["age"]))
+        city = st.text_input("City", value=profile["city"])
+        occupation = st.selectbox(
+            "Profile",
+            options=["Salaried", "Small Business", "Freelancer", "Other"],
+            index=["Salaried", "Small Business", "Freelancer", "Other"].index(profile["occupation"]),
+        )
+        annual_income = st.number_input(
+            "Annual income (Rs.)",
+            min_value=300000,
+            max_value=2000000,
+            step=50000,
+            value=int(profile["annual_income"]),
+        )
+        monthly_income = st.number_input(
+            "Monthly take-home income (Rs.)",
+            min_value=20000,
+            max_value=250000,
+            step=5000,
+            value=int(profile["monthly_income"]),
+        )
+        saved = st.form_submit_button("Save profile and continue", use_container_width=True)
+
+    if saved:
+        if not name.strip():
+            st.error("Please enter your name.")
+            return
+        st.session_state.user_profile = {
+            **profile,
+            "name": name.strip(),
+            "age": age,
+            "city": city.strip() or profile["city"],
+            "occupation": occupation,
+            "annual_income": annual_income,
+            "monthly_income": monthly_income,
+        }
+        push_notification("profile_saved", "Your investor profile has been saved.")
+        go_to("risk")
+        st.rerun()
+
+    if st.button("Back to login"):
+        go_to("welcome")
+        st.rerun()
+
+
+def render_risk() -> None:
+    st.markdown('<div class="step-pill">Step 3 of 7</div>', unsafe_allow_html=True)
+    st.subheader("A few simple questions")
+    st.write("Your answers help us recommend a portfolio that matches your comfort with risk.")
+
+    with st.form("risk_form"):
+        answers: dict[str, int] = {}
+        for question in RISK_QUESTIONS:
+            options = [option["label"] for option in question["options"]]
+            chosen = st.radio(question["prompt"], options=options, index=1, key=f"risk_{question['id']}")
+            selected = next(option for option in question["options"] if option["label"] == chosen)
+            answers[question["id"]] = selected["score"]
+
+        col1, col2 = st.columns(2)
+        with col1:
+            submitted = st.form_submit_button("Save risk profile", use_container_width=True)
+        with col2:
+            skipped = st.form_submit_button("Skip for now", use_container_width=True)
+
+    if submitted:
+        risk_profile = classify_risk_profile(sum(answers.values()))
+        st.session_state.risk_answers = answers
+        st.session_state.risk_profile = risk_profile
+        push_notification("risk_saved", f"Risk profile set to {risk_profile}.")
+        go_to("goal")
+        st.rerun()
+
+    if skipped:
+        st.session_state.risk_answers = {}
+        st.session_state.risk_profile = "Conservative"
+        push_notification("risk_defaulted", "Risk profiling skipped. Default profile set to Conservative.")
+        go_to("goal")
+        st.rerun()
+
+    if st.button("Back to profile"):
+        go_to("profile")
+        st.rerun()
+
+
+def render_goal_creation() -> None:
+    st.markdown('<div class="step-pill">Step 4 of 7</div>', unsafe_allow_html=True)
+    st.subheader("Create your first goal")
+    st.write("Start with one clear goal. You can add more later from the dashboard.")
+
+    selected_goal_type = st.selectbox("Goal type", options=GOAL_TYPES)
+    defaults = GOAL_TYPE_DEFAULTS[selected_goal_type]
+    profile = st.session_state.user_profile
+    risk_profile = st.session_state.risk_profile or "Conservative"
+
+    with st.form("goal_form"):
+        target_amount = st.number_input(
+            "Target amount (Rs.)",
+            min_value=100000,
+            step=50000,
+            value=defaults["target_amount"],
+        )
+        time_years = st.slider(
+            "Time horizon (years)",
+            min_value=1,
+            max_value=30,
+            value=defaults["time_years"],
+        )
+        current_savings = st.number_input(
+            "Current savings toward this goal (Rs.)",
+            min_value=0,
+            step=25000,
+            value=defaults["current_savings"],
+        )
+        submitted = st.form_submit_button("Calculate SIP and continue", use_container_width=True)
+
+    monthly_income = float(profile["monthly_income"])
+    monthly_sip = calculate_required_sip(target_amount, time_years, risk_profile, current_savings)
+    unrealistic = is_goal_unrealistic(monthly_sip, monthly_income)
+
+    preview_col1, preview_col2, preview_col3 = st.columns(3)
+    preview_col1.metric("Recommended monthly SIP", format_currency(monthly_sip))
+    preview_col2.metric("Risk profile", risk_profile)
+    preview_col3.metric("Time horizon", f"{time_years} years")
+
+    if unrealistic:
+        st.warning(
+            f"This goal may be ambitious for a monthly income of {format_currency(monthly_income)}. "
+            "You may want to increase the timeline or lower the target amount."
+        )
+
+    if submitted:
+        goal_id = f"goal-{len(st.session_state.goals) + 1}"
+        goal = {
+            "id": goal_id,
+            "type": selected_goal_type,
+            "target_amount": float(target_amount),
+            "time_years": int(time_years),
+            "current_savings": float(current_savings),
+            "monthly_sip": float(monthly_sip),
+            "risk_profile": risk_profile,
+            "portfolio_key": get_portfolio_for_risk(risk_profile)["key"],
+            "warning": unrealistic,
+            "created_at": datetime.now().strftime("%d %b %Y"),
+            "deleted": False,
+            "progress_months": min(max(time_years * 12 // 6, 1), 12),
+        }
+        st.session_state.goals.append(goal)
+        st.session_state.selected_goal_id = goal_id
+        st.session_state.latest_goal_id = goal_id
+        push_notification("goal_created", f"{selected_goal_type} goal created with a SIP of {format_currency(monthly_sip)}.")
+        if unrealistic:
+            push_notification("goal_warning", "One of your goals needs a high monthly SIP. Review it before investing.")
+        go_to("portfolio")
+        st.rerun()
+
+    if st.button("Back to risk profile"):
+        go_to("risk")
+        st.rerun()
+
+
+def render_portfolio_recommendation() -> None:
+    st.markdown('<div class="step-pill">Step 5 of 7</div>', unsafe_allow_html=True)
+    goal = current_goal()
+    if not goal:
+        st.info("Create a goal first.")
+        if st.button("Go to goal creation"):
+            go_to("goal")
+            st.rerun()
+        return
+
+    portfolio = PORTFOLIOS[goal["portfolio_key"]]
+    st.subheader(f"Recommended plan for your {goal['type'].lower()} goal")
+    st.write(portfolio["summary"])
+
+    top_col1, top_col2, top_col3 = st.columns(3)
+    top_col1.metric("Goal target", format_currency(goal["target_amount"]))
+    top_col2.metric("Monthly SIP", format_currency(goal["monthly_sip"]))
+    top_col3.metric("Expected return range", portfolio["return_range"])
+
+    col1, col2 = st.columns([1.3, 1])
+    with col1:
+        st.markdown('<div class="surface-card">', unsafe_allow_html=True)
+        st.markdown(f"### {portfolio['label']}")
+        st.caption(f"Risk level: {portfolio['risk_label']}")
+        for bucket in portfolio["allocation"]:
+            st.markdown(
+                f'<span class="allocation-chip">{bucket["label"]}: {bucket["weight"]}%</span>',
+                unsafe_allow_html=True,
             )
-            display_df["INR FX Rate"] = display_df["INR FX Rate"].map(lambda value: f"{value:,.4f}")
-            display_df["Price (INR)"] = display_df["Price (INR)"].map(format_inr)
-            display_df["Prev Close (INR)"] = display_df["Prev Close (INR)"].map(format_inr)
-            display_df["Change (%)"] = display_df["Change (%)"].map(lambda value: f"{value:+.2f}%")
-            display_df = display_df[
-                [
-                    "Ticker",
-                    "Exchange Symbol",
-                    "Market",
-                    "Native Price",
-                    "Price (INR)",
-                    "Prev Close (INR)",
-                    "Change (%)",
-                    "INR FX Rate",
-                ]
-            ]
+        st.write("")
+        st.write(portfolio["explanation"])
+        st.markdown("</div>", unsafe_allow_html=True)
+    with col2:
+        st.markdown('<div class="surface-card">', unsafe_allow_html=True)
+        st.markdown("### Why this fits")
+        st.write(f"- Goal type: {goal['type']}")
+        st.write(f"- Risk profile: {goal['risk_profile']}")
+        st.write(f"- Time horizon: {goal['time_years']} years")
+        st.write(f"- Suggested SIP: {format_currency(goal['monthly_sip'])}")
+        if goal["warning"]:
+            st.warning("This plan is still possible, but the SIP is high for the income shared.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-            st.dataframe(display_df, use_container_width=True)
-            st.caption(
-                "Example: BHEL stays around its actual rupee price, while AAPL is shown in INR after conversion."
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("Accept recommendation", use_container_width=True):
+            update_goal(goal["id"], {"accepted": True})
+            push_notification("portfolio_accepted", f"You accepted the {portfolio['label']} portfolio for {goal['type']}.")
+            go_to("execution")
+            st.rerun()
+    with col_b:
+        if st.button("Back to goal details", use_container_width=True):
+            go_to("goal")
+            st.rerun()
+
+
+def render_execution_setup() -> None:
+    st.markdown('<div class="step-pill">Step 6 of 7</div>', unsafe_allow_html=True)
+    goal = current_goal()
+    if not goal:
+        st.info("Create a goal first.")
+        if st.button("Go to goal creation"):
+            go_to("goal")
+            st.rerun()
+        return
+
+    sip_setup = st.session_state.sip_setup
+    kyc_col, sip_col = st.columns([1, 1.2])
+
+    with kyc_col:
+        st.markdown('<div class="surface-card">', unsafe_allow_html=True)
+        st.markdown("### KYC status")
+        status = st.session_state.kyc_status
+        st.write(f"Current status: **{status}**")
+        if status != "Completed":
+            next_status = st.selectbox("Update KYC state", ["Not Started", "Pending", "Completed"], index=["Not Started", "Pending", "Completed"].index(status))
+            if st.button("Save KYC status", use_container_width=True):
+                st.session_state.kyc_status = next_status
+                if next_status == "Pending":
+                    push_notification("kyc_pending", KYC_PENDING_COPY)
+                elif next_status == "Completed":
+                    push_notification("kyc_complete", "KYC completed. You can now set up your SIP.")
+                else:
+                    push_notification("kyc_pending", "KYC is still needed before investments can start.")
+                st.rerun()
+        else:
+            st.success("KYC is complete. SIP setup is unlocked.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with sip_col:
+        st.markdown('<div class="surface-card">', unsafe_allow_html=True)
+        st.markdown("### SIP setup")
+        st.write(f"Recommended amount: **{format_currency(goal['monthly_sip'])} / month**")
+
+        with st.form("sip_setup_form"):
+            amount = st.number_input(
+                "Monthly SIP amount (Rs.)",
+                min_value=500,
+                step=500,
+                value=int(goal["monthly_sip"]),
             )
-        except Exception as exc:
-            st.error(f"Could not load the watchlist: {exc}")
+            debit_day = st.slider("Auto-debit day", min_value=1, max_value=28, value=max(int(sip_setup["debit_day"]), 1))
+            bank_name = st.text_input("Bank nickname", value=sip_setup["bank_name"], placeholder="Salary Account")
+            outcome = st.selectbox("Prototype simulation", ["Success", "Failure"], index=0)
+            submitted = st.form_submit_button("Set up SIP", use_container_width=True)
+
+        if submitted:
+            if st.session_state.kyc_status != "Completed":
+                st.error("Complete KYC before setting up the SIP.")
+                push_notification("kyc_blocked", "SIP setup is blocked until KYC is completed.")
+            elif not bank_name.strip():
+                st.error("Please enter a bank nickname.")
+            else:
+                status = "Active" if outcome == "Success" else "Failed"
+                st.session_state.sip_setup = {
+                    "status": status,
+                    "amount": float(amount),
+                    "debit_day": int(debit_day),
+                    "bank_name": bank_name.strip(),
+                    "goal_id": goal["id"],
+                    "auto_debit": True,
+                    "last_status": status,
+                }
+                update_goal(goal["id"], {"sip_amount": float(amount), "sip_status": status})
+                if status == "Active":
+                    push_notification("sip_success", f"SIP created for {format_currency(amount)} on day {debit_day}.")
+                    go_to("dashboard")
+                    st.rerun()
+                else:
+                    push_notification("sip_failure", "SIP setup failed in the prototype. Review details and retry.")
+                    st.warning("The SIP simulation failed. You can retry below.")
+
+        if sip_setup["status"] == "Failed" and sip_setup["goal_id"] == goal["id"]:
+            if st.button("Retry failed SIP", use_container_width=True):
+                st.session_state.sip_setup["status"] = "Active"
+                st.session_state.sip_setup["last_status"] = "Active"
+                update_goal(goal["id"], {"sip_status": "Active", "sip_amount": st.session_state.sip_setup["amount"]})
+                push_notification("sip_success", "Retry successful. Your SIP is now active.")
+                go_to("dashboard")
+                st.rerun()
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    footer_col1, footer_col2 = st.columns(2)
+    with footer_col1:
+        if st.button("Back to recommendation", use_container_width=True):
+            go_to("portfolio")
+            st.rerun()
+    with footer_col2:
+        if st.button("Go to dashboard", use_container_width=True):
+            go_to("dashboard")
+            st.rerun()
+
+
+def render_dashboard() -> None:
+    st.markdown('<div class="step-pill">Step 7 of 7</div>', unsafe_allow_html=True)
+    st.subheader("Your dashboard")
+
+    goals = [goal for goal in st.session_state.goals if not goal.get("deleted")]
+    monthly_total = sum(goal.get("sip_amount", goal["monthly_sip"]) for goal in goals)
+    active_sip_count = sum(1 for goal in goals if goal.get("sip_status") == "Active")
+    st.info(MARKET_DROP_COPY)
+
+    metric1, metric2, metric3, metric4 = st.columns(4)
+    metric1.metric("Monthly SIP total", format_currency(monthly_total))
+    metric2.metric("Active goals", str(len(goals)))
+    metric3.metric("KYC status", st.session_state.kyc_status)
+    metric4.metric("Active SIPs", str(active_sip_count))
+
+    left_col, right_col = st.columns([1.5, 1])
+    with left_col:
+        st.markdown("### Goal progress")
+        if not goals:
+            st.info("No goals yet. Create one to begin.")
+        for goal in goals:
+            portfolio = PORTFOLIOS[goal["portfolio_key"]]
+            current_value = calculate_future_value(
+                monthly_investment=float(goal.get("sip_amount", goal["monthly_sip"])),
+                annual_return_rate=portfolio["expected_return"],
+                months=goal["progress_months"],
+                current_savings=float(goal["current_savings"]),
+            )
+            progress = min(current_value / goal["target_amount"], 1.0) if goal["target_amount"] else 0.0
+            status_text = goal.get("sip_status", "Pending")
+            st.markdown('<div class="goal-card">', unsafe_allow_html=True)
+            st.markdown(f"#### {goal['type']} goal")
+            st.caption(f"Created on {goal['created_at']} | Portfolio: {portfolio['label']}")
+            st.progress(progress)
+            info_col1, info_col2, info_col3 = st.columns(3)
+            info_col1.metric("Current value", format_currency(current_value))
+            info_col2.metric("Target", format_currency(goal["target_amount"]))
+            info_col3.metric("Monthly SIP", format_currency(goal.get("sip_amount", goal["monthly_sip"])))
+            st.write(f"Progress: **{progress * 100:.1f}%** | SIP status: **{status_text}**")
+            if goal["warning"]:
+                st.warning("This goal needs a relatively high SIP. Consider extending the timeline if needed.")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    with right_col:
+        st.markdown("### Recent updates")
+        for item in st.session_state.notifications[:6]:
+            st.markdown(
+                f"""
+                <div class="feed-card" style="margin-bottom: 0.8rem;">
+                  <div class="eyebrow">{item['kind'].replace('_', ' ')}</div>
+                  <div style="font-weight: 600; margin: 0.25rem 0;">{item['message']}</div>
+                  <div style="font-size: 0.8rem; color: #475569;">{item['timestamp']}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("### Manage goals")
+    goal_options = {f"{goal['type']} ({goal['id']})": goal["id"] for goal in goals}
+    if goal_options:
+        chosen_label = st.selectbox("Select a goal", list(goal_options.keys()))
+        chosen_id = goal_options[chosen_label]
+        st.session_state.selected_goal_id = chosen_id
+        action_col1, action_col2 = st.columns(2)
+        with action_col1:
+            if st.button("Create another goal", use_container_width=True):
+                go_to("goal")
+                st.rerun()
+        with action_col2:
+            if st.button("Delete selected goal", use_container_width=True):
+                st.session_state.delete_goal_id = chosen_id
+
+        if st.session_state.delete_goal_id:
+            st.warning("Deleting a goal removes it from your dashboard. Please confirm.")
+            confirm_col1, confirm_col2 = st.columns(2)
+            with confirm_col1:
+                if st.button("Confirm delete", use_container_width=True):
+                    update_goal(st.session_state.delete_goal_id, {"deleted": True})
+                    push_notification("goal_deleted", "One goal was deleted from the dashboard.")
+                    st.session_state.delete_goal_id = None
+                    st.rerun()
+            with confirm_col2:
+                if st.button("Cancel", use_container_width=True):
+                    st.session_state.delete_goal_id = None
+                    st.rerun()
     else:
-        st.info("Add a ticker to start tracking your watchlist.")
+        if st.button("Create your first goal", use_container_width=True):
+            go_to("goal")
+            st.rerun()
+
+    if st.session_state.sip_setup["status"] == "Failed":
+        st.error("A SIP attempt is marked as failed.")
+        if st.button("Retry failed SIP from dashboard", use_container_width=False):
+            st.session_state.sip_setup["status"] = "Active"
+            goal_id = st.session_state.sip_setup["goal_id"]
+            if goal_id:
+                update_goal(goal_id, {"sip_status": "Active"})
+            push_notification("sip_success", "Retry successful. Your SIP is now active.")
+            st.rerun()
+
+
+def main() -> None:
+    init_state()
+    render_shell()
+
+    current_step = st.session_state.current_step
+    if current_step == "welcome":
+        render_welcome()
+    elif current_step == "profile":
+        render_profile()
+    elif current_step == "risk":
+        render_risk()
+    elif current_step == "goal":
+        render_goal_creation()
+    elif current_step == "portfolio":
+        render_portfolio_recommendation()
+    elif current_step == "execution":
+        render_execution_setup()
+    else:
+        render_dashboard()
+
+
+if __name__ == "__main__":
+    main()
