@@ -21,6 +21,9 @@ An interactive Streamlit app for portfolio analysis across Indian and U.S. stock
 - Produces simple `Buy`, `Hold`, or `Sell` suggestions from market conditions
 - Adds plain-English AI-style commentary from the computed metrics
 
+## 🔴 Live Demo
+> Run locally using the steps below — or deploy free on [Streamlit Cloud](https://stock-analyser-and-portfolio-optimizer.onrender.com/)
+
 ## Current Features
 
 ### Optimizer
