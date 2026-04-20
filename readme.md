@@ -22,7 +22,7 @@ An interactive Streamlit app for portfolio analysis across Indian and U.S. stock
 - Adds plain-English AI-style commentary from the computed metrics
 
 ## 🔴 Live Demo
-> Run locally using the steps below — or deploy free on [Streamlit Cloud](https://stock-analyser-and-portfolio-optimizer.onrender.com/)
+> Run locally using the steps below — or Live deployment on [Streamlit Cloud](https://stock-analyser-and-portfolio-optimizer.onrender.com/)
 
 ## Current Features
 
